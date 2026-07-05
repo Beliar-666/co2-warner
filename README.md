@@ -12,7 +12,7 @@ ESPHome-Projekt für einen ESP32-WROOM-32 Luftqualitätsmonitor mit Web-Oberflä
 - **Piezo** – Alarm bei hohem CO₂
 - **Web-GUI** (ESPHome v3) – Messwerte, Bedienelemente, Debug-Log
 - **Kalibrierung** – MH-Z19 Nullpunkt & MQ135 Frischluft per Button
-- Statische IP: `192.168.178.55`
+- Statische IP: `xxx.xxx.xxx.xxx`
 
 ## Hardware (GPIO)
 
