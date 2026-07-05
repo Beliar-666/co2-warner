@@ -53,7 +53,7 @@ ESPHome-Projekt für einen ESP32-WROOM-32 Luftqualitätsmonitor mit Web-Oberflä
 
 ## Web-Oberfläche
 
-Nach dem Flash: [http://192.168.178.55](http://192.168.178.55)
+Nach dem Flash: [http://YourSensorIP](http://YourSensorIP)
 
 - **Messwerte** – alle Sensoren inkl. MQ135 AQI
 - **Bedienelemente** – Backlight, Kontrast, Alarm-Schwelle, Kalibrierung
