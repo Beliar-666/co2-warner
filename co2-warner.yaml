@@ -1,0 +1,531 @@
+esphome:
+  name: co2-warner
+  friendly_name: CO2 Warner
+  on_boot:
+    - priority: -10
+      then:
+        - light.turn_on:
+            id: display_backlight
+            brightness: 80%
+        - light.turn_on:
+            id: status_leds
+            brightness: 100%
+            effect: "Sensor Colors"
+    - priority: 300
+      then:
+        - lambda: |-
+            uint8_t c = (uint8_t) id(display_contrast).state;
+            id(co2_display).set_contrast(c);
+            id(co2_display).command(0x21);
+            id(co2_display).command(0x80 | c);
+            id(co2_display).command(0x20);
+    - priority: 400
+      then:
+        - component.update: co2_display
+
+esp32:
+  board: esp32dev
+  framework:
+    type: arduino
+
+# ── Pin map (adjust if your wiring differs) ──────────────────────────────────
+# BME280 I2C .............. SDA GPIO21, SCL GPIO22
+# MH-Z19 UART ............. TX GPIO17, RX GPIO16
+# MQ135 analog ............ GPIO34 (ADC1)
+# WS2812 data ............. GPIO5  (4 LEDs in series)
+# PCD8544 SPI ............. CLK GPIO18, MOSI GPIO23, CS GPIO13, DC GPIO4, RST GPIO26
+#   (NICHT GPIO2/GPIO15 – Boot-Strapping-Pins!)
+# Display backlight ....... GPIO27 (aktiv-LOW am Nokia-5110-Modul → inverted: true)
+# Piezo buzzer ............ GPIO25
+
+substitutions:
+  co2_min: "400"       # ppm – green
+  co2_max: "2000"      # ppm – red
+  temp_min: "15"       # °C – blue
+  temp_max: "30"       # °C – red
+  hum_min: "30"        # % – green
+  hum_max: "80"        # % – blue
+  mq_min: "0"          # AQI – grün
+  mq_max: "200"        # AQI – rot
+  mq_rload: "10.0"     # kOhm Lastwiderstand am MQ135-Modul
+  mq_vcc: "3.3"        # Versorgungsspannung MQ135
+  mq_rzero: "76.63"    # Kalibrierwert Frischluft (per Button anpassen)
+
+globals:
+  - id: mq135_rzero
+    type: float
+    restore_value: true
+    initial_value: ${mq_rzero}
+
+logger:
+
+api:
+  encryption:
+    key: !secret api_encryption_key
+
+ota:
+  - platform: esphome
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  power_save_mode: none
+  manual_ip:
+    static_ip: 192.168.178.55
+    gateway: 192.168.178.1
+    subnet: 255.255.255.0
+    dns1: 192.168.178.1
+  ap:
+    ssid: "CO2-Warner-Fallback"
+    password: "12345678"
+
+captive_portal:
+
+web_server:
+  version: 3
+  port: 80
+  log: true
+  js_include: layout.js
+  sorting_groups:
+    - id: measurements
+      name: "Messwerte"
+      sorting_weight: 10
+    - id: controls
+      name: "Bedienelemente"
+      sorting_weight: 20
+
+# ── Buses ─────────────────────────────────────────────────────────────────────
+
+i2c:
+  sda: GPIO21
+  scl: GPIO22
+  scan: true
+
+uart:
+  id: uart_mhz19
+  tx_pin: GPIO17
+  rx_pin: GPIO16
+  baud_rate: 9600
+
+spi:
+  clk_pin: GPIO18
+  mosi_pin: GPIO23
+
+# ── Outputs ───────────────────────────────────────────────────────────────────
+
+output:
+  - platform: ledc
+    pin:
+      number: GPIO27
+      inverted: true
+    id: backlight_pwm
+    frequency: 1000 Hz
+
+  - platform: ledc
+    pin: GPIO25
+    id: buzzer_pwm
+    frequency: 2500 Hz
+
+# ── Lights ────────────────────────────────────────────────────────────────────
+
+light:
+  - platform: monochromatic
+    output: backlight_pwm
+    name: "Display Backlight"
+    id: display_backlight
+    restore_mode: RESTORE_DEFAULT_ON
+    default_transition_length: 0.3s
+    web_server:
+      sorting_group_id: controls
+      sorting_weight: 20
+
+  - platform: esp32_rmt_led_strip
+    rgb_order: GRB
+    chipset: ws2812
+    pin: GPIO5
+    num_leds: 4
+    name: "Status LEDs"
+    id: status_leds
+    restore_mode: ALWAYS_ON
+    web_server:
+      sorting_group_id: controls
+      sorting_weight: 30
+    effects:
+      - addressable_lambda:
+          name: "Sensor Colors"
+          update_interval: 1s
+          lambda: |-
+            // LED 0 – CO2: green → red
+            float co2 = id(mhz19_co2).state;
+            if (std::isnan(co2)) co2 = ${co2_min};
+            float co2_t = (co2 - ${co2_min}) / (${co2_max} - ${co2_min});
+            co2_t = std::clamp(co2_t, 0.0f, 1.0f);
+            it[0] = Color((uint8_t)(co2_t * 255), (uint8_t)((1.0f - co2_t) * 255), 0);
+
+            // LED 1 – Temperature: blue → red
+            float temp = id(bme280_temp).state;
+            if (std::isnan(temp)) temp = ${temp_min};
+            float temp_t = (temp - ${temp_min}) / (${temp_max} - ${temp_min});
+            temp_t = std::clamp(temp_t, 0.0f, 1.0f);
+            it[1] = Color((uint8_t)(temp_t * 255), 0, (uint8_t)((1.0f - temp_t) * 255));
+
+            // LED 2 – Humidity: green → blue
+            float hum = id(bme280_humidity).state;
+            if (std::isnan(hum)) hum = ${hum_min};
+            float hum_t = (hum - ${hum_min}) / (${hum_max} - ${hum_min});
+            hum_t = std::clamp(hum_t, 0.0f, 1.0f);
+            it[2] = Color(0, (uint8_t)((1.0f - hum_t) * 255), (uint8_t)(hum_t * 255));
+
+            // LED 3 – MQ135 AQI: green → red
+            float aqi = id(mq135_aqi).state;
+            if (std::isnan(aqi)) aqi = ${mq_min};
+            float mq_t = (aqi - ${mq_min}) / (${mq_max} - ${mq_min});
+            mq_t = std::clamp(mq_t, 0.0f, 1.0f);
+            it[3] = Color((uint8_t)(mq_t * 255), (uint8_t)((1.0f - mq_t) * 255), 0);
+
+# ── Sensors ───────────────────────────────────────────────────────────────────
+
+sensor:
+  - platform: mhz19
+    id: mhz19_sensor
+    uart_id: uart_mhz19
+    co2:
+      name: "CO2"
+      id: mhz19_co2
+      unit_of_measurement: "ppm"
+      accuracy_decimals: 0
+      web_server:
+        sorting_group_id: measurements
+        sorting_weight: 10
+    temperature:
+      name: "MH-Z19 Temperatur"
+      id: mhz19_temp
+      web_server:
+        sorting_group_id: measurements
+        sorting_weight: 50
+    update_interval: 60s
+    automatic_baseline_calibration: true
+
+  - platform: bme280_i2c
+    address: 0x76
+    temperature:
+      name: "Temperatur"
+      id: bme280_temp
+      unit_of_measurement: "°C"
+      accuracy_decimals: 1
+      web_server:
+        sorting_group_id: measurements
+        sorting_weight: 20
+    humidity:
+      name: "Luftfeuchtigkeit"
+      id: bme280_humidity
+      unit_of_measurement: "%"
+      accuracy_decimals: 0
+      web_server:
+        sorting_group_id: measurements
+        sorting_weight: 30
+    pressure:
+      name: "Luftdruck"
+      id: bme280_pressure
+      unit_of_measurement: "hPa"
+      accuracy_decimals: 0
+      web_server:
+        sorting_group_id: measurements
+        sorting_weight: 40
+    update_interval: 30s
+
+  - platform: adc
+    pin: GPIO34
+    id: mq135_raw
+    internal: true
+    attenuation: 12db
+    update_interval: 2s
+    filters:
+      - sliding_window_moving_average:
+          window_size: 15
+          send_every: 5
+
+  - platform: template
+    name: "MQ135 Widerstand"
+    id: mq135_resistance
+    internal: true
+    unit_of_measurement: "kΩ"
+    accuracy_decimals: 2
+    update_interval: 5s
+    lambda: |-
+      float v = id(mq135_raw).state;
+      if (std::isnan(v) || v < 0.01f) return NAN;
+      return (${mq_vcc} * ${mq_rload} / v) - ${mq_rload};
+
+  - platform: template
+    name: "MQ135 korrigierter Widerstand"
+    id: mq135_resistance_corrected
+    internal: true
+    unit_of_measurement: "kΩ"
+    accuracy_decimals: 2
+    update_interval: 5s
+    lambda: |-
+      float rs = id(mq135_resistance).state;
+      if (std::isnan(rs)) return NAN;
+      float temp = id(bme280_temp).state;
+      float hum = id(bme280_humidity).state;
+      if (std::isnan(temp)) temp = 20.0f;
+      if (std::isnan(hum)) hum = 50.0f;
+      float corr;
+      if (temp < 20.0f) {
+        corr = 0.00035f * temp * temp - 0.02718f * temp + 1.39538f - (hum - 33.0f) * 0.0018f;
+      } else {
+        corr = -0.003333333f * temp - 0.002307077f * hum + 1.150038127f;
+      }
+      if (corr < 0.01f) return NAN;
+      return rs / corr;
+
+  - platform: template
+    name: "MQ135 PPM"
+    id: mq135_ppm
+    unit_of_measurement: "ppm"
+    accuracy_decimals: 0
+    update_interval: 5s
+    web_server:
+      sorting_group_id: measurements
+      sorting_weight: 60
+    lambda: |-
+      float rs = id(mq135_resistance_corrected).state;
+      float rzero = id(mq135_rzero);
+      if (std::isnan(rs) || rzero < 0.01f) return NAN;
+      return 116.6020682f * pow(rs / rzero, -2.769034857f);
+
+  - platform: template
+    name: "MQ135 AQI"
+    id: mq135_aqi
+    unit_of_measurement: "AQI"
+    accuracy_decimals: 0
+    update_interval: 5s
+    web_server:
+      sorting_group_id: measurements
+      sorting_weight: 55
+    lambda: |-
+      float ppm = id(mq135_ppm).state;
+      if (std::isnan(ppm)) return NAN;
+      float aqi;
+      if (ppm <= 600.0f) {
+        aqi = ppm * 0.0833f;
+      } else if (ppm <= 800.0f) {
+        aqi = 50.0f + (ppm - 600.0f) * 0.25f;
+      } else if (ppm <= 1000.0f) {
+        aqi = 100.0f + (ppm - 800.0f) * 0.25f;
+      } else if (ppm <= 1500.0f) {
+        aqi = 150.0f + (ppm - 1000.0f) * 0.2f;
+      } else if (ppm <= 2000.0f) {
+        aqi = 250.0f + (ppm - 1500.0f) * 0.2f;
+      } else {
+        aqi = 350.0f + (ppm - 2000.0f) * 0.15f;
+      }
+      return std::clamp(aqi, 0.0f, 500.0f);
+
+  - platform: wifi_signal
+    name: "WiFi Signal"
+    id: wifi_rssi
+    internal: true
+    update_interval: 30s
+
+  - platform: uptime
+    name: "Uptime"
+    id: uptime_sensor
+    internal: true
+    update_interval: 30s
+
+text_sensor:
+  - platform: wifi_info
+    ip_address:
+      name: "IP Adresse"
+      id: device_ip
+      internal: true
+
+  - platform: template
+    name: "Uptime Anzeige"
+    id: uptime_display
+    internal: true
+    update_interval: 30s
+    lambda: |-
+      int seconds = (int) id(uptime_sensor).state;
+      int days = seconds / 86400;
+      seconds %= 86400;
+      int hours = seconds / 3600;
+      seconds %= 3600;
+      int minutes = seconds / 60;
+      return (
+        (days ? String(days) + "d " : "") +
+        (hours ? String(hours) + "h " : "") +
+        String(minutes) + "m"
+      ).c_str();
+
+# ── Alarm ─────────────────────────────────────────────────────────────────────
+
+number:
+  - platform: template
+    name: "CO2 Alarm Schwelle"
+    id: co2_alarm_threshold
+    unit_of_measurement: "ppm"
+    min_value: 400
+    max_value: 5000
+    step: 50
+    initial_value: 1200
+    optimistic: true
+    restore_value: true
+    mode: box
+    web_server:
+      sorting_group_id: controls
+      sorting_weight: 10
+
+  - platform: template
+    name: "Display Kontrast"
+    id: display_contrast
+    min_value: 0
+    max_value: 127
+    step: 1
+    initial_value: 85
+    optimistic: true
+    restore_value: true
+    mode: slider
+    web_server:
+      sorting_group_id: controls
+      sorting_weight: 20
+    set_action:
+      - lambda: |-
+          uint8_t c = (uint8_t) x;
+          id(co2_display).set_contrast(c);
+          id(co2_display).command(0x21);
+          id(co2_display).command(0x80 | c);
+          id(co2_display).command(0x20);
+
+button:
+  - platform: template
+    name: "MH-Z19 Nullpunkt-Kalibrierung"
+    icon: mdi:target
+    web_server:
+      sorting_group_id: controls
+      sorting_weight: 40
+    on_press:
+      - mhz19.calibrate_zero: mhz19_sensor
+
+  - platform: template
+    name: "MQ135 Frischluft-Kalibrierung"
+    icon: mdi:air-filter
+    web_server:
+      sorting_group_id: controls
+      sorting_weight: 50
+    on_press:
+      - lambda: |-
+          float rs = id(mq135_resistance_corrected).state;
+          if (!std::isnan(rs) && rs > 0.01f) {
+            id(mq135_rzero) = rs;
+          }
+
+switch:
+  - platform: template
+    name: "Piezo Alarm"
+    id: piezo_alarm
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_OFF
+    web_server:
+      sorting_group_id: controls
+      sorting_weight: 30
+    turn_on_action:
+      - output.set_level:
+          id: buzzer_pwm
+          level: 50%
+    turn_off_action:
+      - output.turn_off: buzzer_pwm
+
+# Auto alarm: beep when CO2 exceeds threshold
+binary_sensor:
+  - platform: template
+    name: "CO2 zu hoch"
+    id: co2_high
+    web_server:
+      sorting_group_id: measurements
+      sorting_weight: 15
+    lambda: |-
+      float co2 = id(mhz19_co2).state;
+      float limit = id(co2_alarm_threshold).state;
+      if (std::isnan(co2) || std::isnan(limit)) return false;
+      return co2 >= limit;
+
+interval:
+  - interval: 2s
+    then:
+      - if:
+          condition:
+            binary_sensor.is_on: co2_high
+          then:
+            - switch.turn_on: piezo_alarm
+          else:
+            - switch.turn_off: piezo_alarm
+
+  - interval: 5s
+    then:
+      - display.page.show_next: co2_display
+      - component.update: co2_display
+
+# ── Display ───────────────────────────────────────────────────────────────────
+
+font:
+  # Überschriften: kompakt & fett
+  - file:
+      type: gfonts
+      family: Roboto+Condensed
+      weight: 700
+    id: font_title
+    size: 11
+    bpp: 1
+  # Messwerte: Monospace, scharf auf 1-Bit-Display (bpp: 1)
+  - file: "gfonts://Roboto+Mono"
+    id: font_body
+    size: 10
+    bpp: 1
+
+display:
+  - platform: pcd8544
+    id: co2_display
+    cs_pin: GPIO13
+    dc_pin: GPIO4
+    reset_pin: GPIO26
+    contrast: 85
+    spi_mode: MODE0
+    data_rate: 2MHz
+    pages:
+      - id: page_system
+        lambda: |-
+          it.printf(0, 0, id(font_title), "System");
+          it.printf(0, 12, id(font_body), "%s", id(device_ip).state.c_str());
+          float rssi = id(wifi_rssi).state;
+          if (std::isnan(rssi)) rssi = 0;
+          it.printf(0, 24, id(font_body), "RSSI:%.0f dBm", rssi);
+          it.printf(0, 36, id(font_body), "Up:%s", id(uptime_display).state.c_str());
+
+      - id: page_air
+        lambda: |-
+          float co2 = id(mhz19_co2).state;
+          float aqi = id(mq135_aqi).state;
+          float ppm = id(mq135_ppm).state;
+          if (std::isnan(co2)) co2 = 0;
+          if (std::isnan(aqi)) aqi = 0;
+          if (std::isnan(ppm)) ppm = 0;
+          it.printf(0, 0, id(font_title), "Luft");
+          it.printf(0, 12, id(font_body), "CO2:%.0f ppm", co2);
+          it.printf(0, 24, id(font_body), "AQI:%.0f", aqi);
+          it.printf(0, 36, id(font_body), "PPM:%.0f", ppm);
+
+      - id: page_climate
+        lambda: |-
+          float temp = id(bme280_temp).state;
+          float hum = id(bme280_humidity).state;
+          float press = id(bme280_pressure).state;
+          if (std::isnan(temp)) temp = 0;
+          if (std::isnan(hum)) hum = 0;
+          if (std::isnan(press)) press = 0;
+          it.printf(0, 0, id(font_title), "Klima");
+          it.printf(0, 12, id(font_body), "T:%.1f C", temp);
+          it.printf(0, 24, id(font_body), "H:%.0f %%", hum);
+          it.printf(0, 36, id(font_body), "P:%.0f hPa", press);
